@@ -24,17 +24,35 @@ const REQUIRED_MIMALLOC_EXPORTS: &[&str] = &[
     "mi_calloc",
     "mi_realloc",
     "mi_rezalloc",
+    "mi_recalloc",
     "mi_malloc_aligned",
+    "mi_malloc_aligned_at",
     "mi_realloc_aligned",
+    "mi_realloc_aligned_at",
+    "mi_recalloc_aligned",
+    "mi_recalloc_aligned_at",
+    "mi_aligned_recalloc",
     "mi_expand",
     "mi_free",
     "mi_usable_size",
     "mi_is_in_heap_region",
     "mi_version",
     "mi_stats_print",
+    "mi_heap_new",
+    "mi_heap_destroy",
+    "mi_heap_malloc",
+    "mi_heap_zalloc",
+    "mi_heap_realloc",
+    "mi_heap_rezalloc",
+    "mi_strdup",
+    "mi_wcsdup",
+    "mi_mbsdup",
+    "mi_dupenv_s",
+    "mi_wdupenv_s",
+    "mi_check_owned",
 ];
 
-// ---- Minimal Win32 FFI for --inject (early-bird CREATE_SUSPENDED APC) ----
+// ---- Minimal Win32 / NT FFI for --inject (in-memory PE64 import injection) ----
 #[repr(C)]
 struct StartupInfoW {
     cb: u32,
@@ -65,6 +83,37 @@ struct ProcessInformation {
     dw_thread_id: u32,
 }
 
+#[repr(C)]
+struct ProcessBasicInformation {
+    reserved1: usize,
+    peb_base_address: usize,
+    reserved2: [usize; 2],
+    unique_process_id: usize,
+    reserved3: usize,
+}
+
+#[repr(C)]
+struct MemoryBasicInformation {
+    base_address: usize,
+    allocation_base: usize,
+    allocation_protect: u32,
+    partition_id: u16,
+    _pad1: u16,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    mem_type: u32,
+    _pad2: u32,
+}
+
+type PfnNtQueryInformationProcess = unsafe extern "system" fn(
+    process_handle: isize,
+    process_information_class: u32,
+    process_information: *mut core::ffi::c_void,
+    process_information_length: u32,
+    return_length: *mut u32,
+) -> i32;
+
 #[link(name = "kernel32")]
 extern "system" {
     fn CreateProcessW(
@@ -86,6 +135,26 @@ extern "system" {
         fl_allocation_type: u32,
         fl_protect: u32,
     ) -> *mut core::ffi::c_void;
+    fn VirtualProtectEx(
+        h_process: isize,
+        lp_address: *mut core::ffi::c_void,
+        dw_size: usize,
+        fl_new_protect: u32,
+        lpfl_old_protect: *mut u32,
+    ) -> i32;
+    fn VirtualQueryEx(
+        h_process: isize,
+        lp_address: *const core::ffi::c_void,
+        lp_buffer: *mut MemoryBasicInformation,
+        dw_length: usize,
+    ) -> usize;
+    fn ReadProcessMemory(
+        h_process: isize,
+        lp_base_address: *const core::ffi::c_void,
+        lp_buffer: *mut core::ffi::c_void,
+        n_size: usize,
+        lp_number_of_bytes_read: *mut usize,
+    ) -> i32;
     fn WriteProcessMemory(
         h_process: isize,
         lp_base_address: *mut core::ffi::c_void,
@@ -95,11 +164,6 @@ extern "system" {
     ) -> i32;
     fn GetModuleHandleW(lp_module_name: *const u16) -> isize;
     fn GetProcAddress(h_module: isize, lp_proc_name: *const u8) -> *const core::ffi::c_void;
-    fn QueueUserAPC(
-        pfn_apc: *const core::ffi::c_void,
-        h_thread: isize,
-        dw_data: usize,
-    ) -> u32;
     fn ResumeThread(h_thread: isize) -> u32;
     fn WaitForSingleObject(h_handle: isize, dw_milliseconds: u32) -> u32;
     fn GetExitCodeProcess(h_process: isize, lp_exit_code: *mut u32) -> i32;
@@ -109,7 +173,7 @@ extern "system" {
     fn MoveFileExW(lp_existing_file_name: *const u16, lp_new_file_name: *const u16, dw_flags: u32) -> i32;
 }
 
-// ---- PE64 helpers ----
+// ---- PE32 / PE64 helpers ----
 #[derive(Clone, Debug)]
 struct Section {
     vsz: u32,
@@ -119,6 +183,9 @@ struct Section {
 }
 
 struct PeInfo {
+    machine: u16,
+    is_64bit: bool,
+    image_base: u64,
     pe_off: usize,
     opt_off: usize,
     nsec: usize,
@@ -160,7 +227,11 @@ fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
 }
 
-fn parse_pe(data: &[u8]) -> Result<PeInfo, String> {
+fn align_up_u64(val: u64, align: u64) -> u64 {
+    val.saturating_add(align - 1) & !(align - 1)
+}
+
+fn parse_pe_any(data: &[u8]) -> Result<PeInfo, String> {
     if data.len() < 0x40 || &data[0..2] != b"MZ" {
         return Err("Not a valid MZ executable".into());
     }
@@ -169,25 +240,36 @@ fn parse_pe(data: &[u8]) -> Result<PeInfo, String> {
         return Err("Missing PE signature".into());
     }
     let machine = read_u16(data, pe_off + 4);
-    if machine != 0x8664 {
-        return Err(format!("Only x86-64 PE64 is supported (got machine=0x{machine:04x})"));
-    }
     let nsec = read_u16(data, pe_off + 6) as usize;
     let opt_sz = read_u16(data, pe_off + 20) as usize;
     let opt_off = pe_off + 24;
-    if opt_off + opt_sz > data.len() {
+    if opt_sz < 2 || opt_off + opt_sz > data.len() {
         return Err("Truncated optional header".into());
     }
     let magic = read_u16(data, opt_off);
-    if magic != 0x20B {
-        return Err(format!("Only PE32+ (64-bit) is supported (got magic=0x{magic:04x})"));
-    }
+    let (is_64bit, image_base, num_rva_off, dd_off) = match magic {
+        0x20B => {
+            if opt_sz < 112 {
+                return Err("Truncated PE32+ optional header".into());
+            }
+            (true, read_u64(data, opt_off + 24), opt_off + 108, opt_off + 112)
+        }
+        0x10B => {
+            if opt_sz < 96 {
+                return Err("Truncated PE32 optional header".into());
+            }
+            (false, read_u32(data, opt_off + 28) as u64, opt_off + 92, opt_off + 96)
+        }
+        _ => {
+            return Err(format!("Unsupported PE optional header magic=0x{magic:04x}"));
+        }
+    };
     let sec_align = read_u32(data, opt_off + 32);
     let file_align = read_u32(data, opt_off + 36);
     let size_of_headers = read_u32(data, opt_off + 60);
     let dll_chars = read_u16(data, opt_off + 70);
-    let num_rva = (read_u32(data, opt_off + 108) as usize).min(16);
-    let dd_off = opt_off + 112;
+    let avail_dirs = (opt_off + opt_sz).saturating_sub(dd_off) / 8;
+    let num_rva = (read_u32(data, num_rva_off) as usize).min(16).min(avail_dirs);
     let mut dirs = Vec::with_capacity(num_rva);
     for i in 0..num_rva {
         dirs.push((read_u32(data, dd_off + i * 8), read_u32(data, dd_off + i * 8 + 4)));
@@ -207,6 +289,9 @@ fn parse_pe(data: &[u8]) -> Result<PeInfo, String> {
         });
     }
     Ok(PeInfo {
+        machine,
+        is_64bit,
+        image_base,
         pe_off,
         opt_off,
         nsec,
@@ -219,6 +304,20 @@ fn parse_pe(data: &[u8]) -> Result<PeInfo, String> {
         sec_table_off,
         secs,
     })
+}
+
+fn parse_pe(data: &[u8]) -> Result<PeInfo, String> {
+    let info = parse_pe_any(data)?;
+    if info.machine != 0x8664 {
+        return Err(format!(
+            "Only x86-64 PE64 is supported (got machine=0x{:04x})",
+            info.machine
+        ));
+    }
+    if !info.is_64bit {
+        return Err("Only PE32+ (64-bit) is supported".into());
+    }
+    Ok(info)
 }
 
 fn rva_to_off(secs: &[Section], rva: u32) -> Option<usize> {
@@ -249,6 +348,48 @@ struct ImportDesc {
     funcs: Vec<String>,
 }
 
+fn read_thunk_names(data: &[u8], info: &PeInfo, thunk_rva: u32) -> Vec<String> {
+    let mut funcs = Vec::new();
+    if thunk_rva == 0 {
+        return funcs;
+    }
+    let Some(mut toff) = rva_to_off(&info.secs, thunk_rva) else {
+        return funcs;
+    };
+    if info.is_64bit {
+        while toff + 8 <= data.len() {
+            let val = read_u64(data, toff);
+            if val == 0 {
+                break;
+            }
+            if (val & (1u64 << 63)) != 0 {
+                funcs.push(format!("ORD#{}", val & 0xFFFF));
+            } else if let Some(fno) = rva_to_off(&info.secs, (val & 0x7FFF_FFFF) as u32) {
+                if let Ok(name) = read_cstr(data, fno + 2) {
+                    funcs.push(name);
+                }
+            }
+            toff += 8;
+        }
+    } else {
+        while toff + 4 <= data.len() {
+            let val = read_u32(data, toff);
+            if val == 0 {
+                break;
+            }
+            if (val & (1u32 << 31)) != 0 {
+                funcs.push(format!("ORD#{}", val & 0xFFFF));
+            } else if let Some(fno) = rva_to_off(&info.secs, val & 0x7FFF_FFFF) {
+                if let Ok(name) = read_cstr(data, fno + 2) {
+                    funcs.push(name);
+                }
+            }
+            toff += 4;
+        }
+    }
+    funcs
+}
+
 fn parse_imports(data: &[u8], info: &PeInfo) -> Result<Vec<ImportDesc>, String> {
     if info.dirs.len() < 2 || info.dirs[1].0 == 0 {
         return Ok(Vec::new());
@@ -268,24 +409,8 @@ fn parse_imports(data: &[u8], info: &PeInfo) -> Result<Vec<ImportDesc>, String> 
         let noff = rva_to_off(&info.secs, name_rva)
             .ok_or_else(|| format!("Import DLL name RVA 0x{name_rva:x} unmapped"))?;
         let dll = read_cstr(data, noff)?;
-        let mut funcs = Vec::new();
         let thunk_rva = if ilt != 0 { ilt } else { iat };
-        if let Some(mut toff) = rva_to_off(&info.secs, thunk_rva) {
-            while toff + 8 <= data.len() {
-                let val = read_u64(data, toff);
-                if val == 0 {
-                    break;
-                }
-                if (val & (1u64 << 63)) != 0 {
-                    funcs.push(format!("ORD#{}", val & 0xFFFF));
-                } else if let Some(fno) = rva_to_off(&info.secs, (val & 0x7FFF_FFFF) as u32) {
-                    if let Ok(name) = read_cstr(data, fno + 2) {
-                        funcs.push(name);
-                    }
-                }
-                toff += 8;
-            }
-        }
+        let funcs = read_thunk_names(data, info, thunk_rva);
         out.push(ImportDesc {
             dll,
             raw: [ilt, ts, fwd, name_rva, iat],
@@ -294,6 +419,68 @@ fn parse_imports(data: &[u8], info: &PeInfo) -> Result<Vec<ImportDesc>, String> 
         off += 20;
     }
     Ok(out)
+}
+
+fn parse_delay_imports(data: &[u8], info: &PeInfo) -> Vec<ImportDesc> {
+    if info.dirs.len() <= 13 || info.dirs[13].0 == 0 {
+        return Vec::new();
+    }
+    let Some(mut off) = rva_to_off(&info.secs, info.dirs[13].0) else {
+        return Vec::new();
+    };
+    let dir_size = info.dirs[13].1 as usize;
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while off + 32 <= data.len() && idx < 4096 {
+        if dir_size >= 32 && idx * 32 >= dir_size {
+            break;
+        }
+        let gr_attrs = read_u32(data, off);
+        let name_raw = read_u32(data, off + 4);
+        let iat_raw = read_u32(data, off + 12);
+        let int_raw = read_u32(data, off + 16);
+        if name_raw == 0 {
+            break;
+        }
+        let to_rva = |val: u32| -> u32 {
+            if val == 0 || (gr_attrs & 1) != 0 {
+                val
+            } else {
+                val.wrapping_sub(info.image_base as u32)
+            }
+        };
+        let name_rva = to_rva(name_raw);
+        let int_rva = to_rva(int_raw);
+        let iat_rva = to_rva(iat_raw);
+        if let Some(noff) = rva_to_off(&info.secs, name_rva) {
+            if let Ok(dll) = read_cstr(data, noff) {
+                let funcs = read_thunk_names(data, info, int_rva);
+                out.push(ImportDesc {
+                    dll,
+                    raw: [int_rva, 0, 0, name_rva, iat_rva],
+                    funcs,
+                });
+            }
+        }
+        off += 32;
+        idx += 1;
+    }
+    out
+}
+
+fn read_dependent_load_flags(data: &[u8], info: &PeInfo) -> Option<u16> {
+    if info.dirs.len() <= 10 || info.dirs[10].0 == 0 {
+        return None;
+    }
+    let lc_off = rva_to_off(&info.secs, info.dirs[10].0)?;
+    if info.is_64bit {
+        if lc_off + 0x50 <= data.len() && read_u32(data, lc_off) >= 0x50 {
+            return Some(read_u16(data, lc_off + 0x4E));
+        }
+    } else if lc_off + 0x38 <= data.len() && read_u32(data, lc_off) >= 0x38 {
+        return Some(read_u16(data, lc_off + 0x36));
+    }
+    None
 }
 
 fn parse_exports(data: &[u8], info: &PeInfo) -> Result<Vec<String>, String> {
@@ -660,6 +847,278 @@ fn update_mimalloc(source_spec: &str) -> Result<(), String> {
     Ok(())
 }
 
+struct PeAnalysis {
+    arch: String,
+    size_bytes: usize,
+    signed: bool,
+    cfg: bool,
+    dependent_load_flags: Option<u16>,
+    has_miheap: bool,
+    has_miheap_env: bool,
+    has_minject: bool,
+    delay_imports_count: usize,
+    has_heap_alloc: bool,
+    has_ntdll_rtl_alloc: bool,
+    has_ntdll_heap: bool,
+    has_ucrt: bool,
+    has_msvcrt: bool,
+    has_legacy_crt: bool,
+    legacy_crts: Vec<String>,
+    custom_allocators: Vec<String>,
+    gc_runtimes: Vec<String>,
+    sample_imports: Vec<(String, bool)>,
+}
+
+fn dll_basename_lower(dll: &str) -> String {
+    dll.rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(dll)
+        .to_ascii_lowercase()
+}
+
+fn push_unique_ci(vec: &mut Vec<String>, val: &str) {
+    if !vec.iter().any(|x| x.eq_ignore_ascii_case(val)) {
+        vec.push(val.to_string());
+    }
+}
+
+fn is_legacy_crt_dll(base_lower: &str) -> bool {
+    const PREFIXES: &[&str] = &["msvcr80", "msvcr90", "msvcr100", "msvcr110", "msvcr120"];
+    base_lower.ends_with(".dll") && PREFIXES.iter().any(|p| base_lower.starts_with(p))
+}
+
+fn is_custom_allocator_dll(base_lower: &str) -> bool {
+    matches!(
+        base_lower,
+        "mimalloc.dll" | "tier0.dll" | "tbbmalloc.dll" | "jemalloc.dll" | "chrome.dll" | "chrome_elf.dll"
+    )
+}
+
+fn is_gc_runtime_dll(base_lower: &str) -> bool {
+    matches!(
+        base_lower,
+        "jvm.dll" | "coreclr.dll" | "clrjit.dll" | "unityplayer.dll"
+    ) || (base_lower.starts_with("mono-") && base_lower.ends_with(".dll"))
+}
+
+fn analyze_pe(path: &Path) -> Result<PeAnalysis, String> {
+    let data = fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let info = parse_pe_any(&data)?;
+    let regular_imports = parse_imports(&data, &info)?;
+    let delay_imports = parse_delay_imports(&data, &info);
+    let dependent_load_flags = read_dependent_load_flags(&data, &info);
+
+    let arch = match info.machine {
+        0x8664 => "x64".to_string(),
+        0x014c => "x86".to_string(),
+        0xAA64 => "arm64".to_string(),
+        other => format!("unknown(0x{other:04x})"),
+    };
+    let signed = info.dirs.len() > 4 && info.dirs[4].0 != 0 && info.dirs[4].1 > 0;
+    let cfg = (info.dll_chars & 0x4000) != 0;
+
+    let mut has_miheap = false;
+    let mut has_miheap_env = false;
+    let mut has_minject = false;
+    let mut has_heap_alloc = false;
+    let mut has_ntdll_rtl_alloc = false;
+    let mut has_ntdll_heap = false;
+    let mut has_ucrt = false;
+    let mut has_msvcrt = false;
+    let mut legacy_crts = Vec::new();
+    let mut custom_allocators = Vec::new();
+    let mut gc_runtimes = Vec::new();
+    let mut sample_imports = Vec::new();
+
+    for (is_delay, desc) in regular_imports
+        .iter()
+        .map(|d| (false, d))
+        .chain(delay_imports.iter().map(|d| (true, d)))
+    {
+        if sample_imports.len() < 8 {
+            sample_imports.push((desc.dll.clone(), is_delay));
+        }
+        let base = dll_basename_lower(&desc.dll);
+        if base == MIHEAP_DLL {
+            has_miheap = true;
+        } else if base == MIHEAP_ENV_DLL {
+            has_miheap_env = true;
+        } else if base == "mimalloc-redirect.dll" {
+            has_minject = true;
+        }
+
+        if base == "ucrtbase.dll" || base == "ucrtbased.dll" || base.starts_with("api-ms-win-crt-heap-")
+        {
+            has_ucrt = true;
+        } else if base == "msvcrt.dll" {
+            has_msvcrt = true;
+        } else if is_legacy_crt_dll(&base) {
+            push_unique_ci(&mut legacy_crts, &desc.dll);
+        }
+
+        if base == "kernel32.dll"
+            || base == "kernelbase.dll"
+            || base.starts_with("api-ms-win-core-heap-")
+        {
+            if desc.funcs.iter().any(|f| f == "HeapAlloc") {
+                has_heap_alloc = true;
+            }
+        } else if base == "ntdll.dll" {
+            if desc.funcs.iter().any(|f| f == "RtlAllocateHeap") {
+                has_ntdll_rtl_alloc = true;
+                has_ntdll_heap = true;
+            } else if desc.funcs.iter().any(|f| {
+                matches!(
+                    f.as_str(),
+                    "RtlReAllocateHeap" | "RtlFreeHeap" | "RtlSizeHeap"
+                )
+            }) {
+                has_ntdll_heap = true;
+            }
+        }
+
+        if is_custom_allocator_dll(&base) {
+            push_unique_ci(&mut custom_allocators, &desc.dll);
+        }
+        if is_gc_runtime_dll(&base) {
+            push_unique_ci(&mut gc_runtimes, &desc.dll);
+        }
+    }
+
+    Ok(PeAnalysis {
+        arch,
+        size_bytes: data.len(),
+        signed,
+        cfg,
+        dependent_load_flags,
+        has_miheap,
+        has_miheap_env,
+        has_minject,
+        delay_imports_count: delay_imports.len(),
+        has_heap_alloc,
+        has_ntdll_rtl_alloc,
+        has_ntdll_heap,
+        has_ucrt,
+        has_msvcrt,
+        has_legacy_crt: !legacy_crts.is_empty(),
+        legacy_crts,
+        custom_allocators,
+        gc_runtimes,
+        sample_imports,
+    })
+}
+
+fn classify_pe(a: &PeAnalysis) -> (&'static str, &'static str, String) {
+    if a.arch != "x64" {
+        return (
+            "unsupported_arch",
+            "unsupported_arch",
+            format!(
+                "Unsupported PE architecture ({}); Phase 1-3 supports x64 PE32+ only.",
+                a.arch
+            ),
+        );
+    }
+    if a.has_miheap {
+        return (
+            "miheap",
+            "already_mimalloc",
+            "Already imports miheap.dll (universal mimalloc redirector).".into(),
+        );
+    }
+    if !a.gc_runtimes.is_empty() {
+        return (
+            "gc_runtime",
+            "gc_runtime",
+            format!(
+                "Managed / GC runtime detected ({}); use runtime-native memory flags.",
+                a.gc_runtimes.join(", ")
+            ),
+        );
+    }
+    let non_mi_custom: Vec<&str> = a
+        .custom_allocators
+        .iter()
+        .filter(|d| !dll_basename_lower(d).eq("mimalloc.dll"))
+        .map(|s| s.as_str())
+        .collect();
+    if !non_mi_custom.is_empty() {
+        return (
+            "custom_allocator",
+            "custom_allocator",
+            format!(
+                "Custom allocator detected ({}); non-CRT custom/arena allocators are skipped by rminject.",
+                non_mi_custom.join(", ")
+            ),
+        );
+    }
+    if a
+        .custom_allocators
+        .iter()
+        .any(|d| dll_basename_lower(d) == "mimalloc.dll")
+    {
+        return (
+            "mimalloc",
+            "already_mimalloc",
+            "Already imports mimalloc.dll.".into(),
+        );
+    }
+    if a.has_ucrt {
+        return (
+            "crt_ucrt",
+            "eligible",
+            "Dynamic UCRT (ucrtbase.dll / api-ms-win-crt-heap); eligible for non-destructive inline CRT hooks.".into(),
+        );
+    }
+    if a.has_msvcrt {
+        return (
+            "crt_msvcrt",
+            "eligible",
+            "Dynamic MSVCRT (msvcrt.dll); eligible for non-destructive inline CRT hooks.".into(),
+        );
+    }
+    if a.has_legacy_crt {
+        return (
+            "crt_legacy",
+            "eligible",
+            format!(
+                "Legacy dynamic MSVC CRT ({}); eligible for non-destructive inline CRT hooks.",
+                a.legacy_crts.join(", ")
+            ),
+        );
+    }
+    if a.has_heap_alloc || a.has_ntdll_heap {
+        return (
+            "win32_heap",
+            "eligible",
+            "Static CRT (/MT) or Rust Win32 HeapAlloc/RtlAllocateHeap; eligible for scoped IAT hooks.".into(),
+        );
+    }
+    (
+        "unknown",
+        "ineligible",
+        "No direct CRT heap or Win32 HeapAlloc imports detected in top-level executable.".into(),
+    )
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn show_status(paths: &[String]) -> Result<(), String> {
     let mi_dll = find_on_path("mimalloc.dll");
     let mh_dll = find_on_path(MIHEAP_DLL);
@@ -696,36 +1155,111 @@ fn show_status(paths: &[String]) -> Result<(), String> {
     );
     for p in paths {
         let path = Path::new(p);
-        let data = fs::read(path).map_err(|e| format!("Cannot read {p}: {e}"))?;
-        let info = parse_pe(&data)?;
-        let imports = parse_imports(&data, &info)?;
-        let has_miheap = imports.iter().any(|d| d.dll.eq_ignore_ascii_case(MIHEAP_DLL));
-        let has_env = imports
-            .iter()
-            .any(|d| d.dll.eq_ignore_ascii_case(MIHEAP_ENV_DLL));
-        let has_minject = imports
-            .iter()
-            .any(|d| d.dll.eq_ignore_ascii_case("mimalloc-redirect.dll"));
-        let has_heapalloc = imports.iter().any(|d| {
-            d.dll.eq_ignore_ascii_case("kernel32.dll")
-                && d.funcs.iter().any(|f| f == "HeapAlloc")
-        });
-        let has_crt = imports.iter().any(|d| {
-            let l = d.dll.to_ascii_lowercase();
-            l.starts_with("api-ms-win-crt-heap-") || l == "ucrtbase.dll"
-        });
-        let signed = info.dirs.len() > 4 && info.dirs[4].1 > 0;
-        let cfg = (info.dll_chars & 0x4000) != 0;
+        let a = analyze_pe(path)?;
+        let dep_str = match a.dependent_load_flags {
+            Some(f) => format!("0x{f:04x}"),
+            None => "none".to_string(),
+        };
+        let heap_alloc_any = a.has_heap_alloc || a.has_ntdll_rtl_alloc;
+        let custom_str = if a.custom_allocators.is_empty() {
+            "none".to_string()
+        } else {
+            a.custom_allocators.join(",")
+        };
+        let gc_str = if a.gc_runtimes.is_empty() {
+            "none".to_string()
+        } else {
+            a.gc_runtimes.join(",")
+        };
         println!(
-            "\n{} ({} B, CFG={cfg}, signed={signed})\n  miheap_env={has_env}  miheap={has_miheap}  minject={has_minject}  HeapAlloc={has_heapalloc}  crt_heap={has_crt}",
+            "\n{} ({} B, arch={}, CFG={}, signed={}, DependentLoadFlags={dep_str})",
             path.display(),
-            data.len()
+            a.size_bytes,
+            a.arch,
+            a.cfg,
+            a.signed,
         );
-        for (idx, d) in imports.iter().take(5).enumerate() {
-            println!("  [{idx}] {}", d.dll);
+        println!(
+            "  miheap_env={}  miheap={}  minject={}  delay_imports={}",
+            a.has_miheap_env, a.has_miheap, a.has_minject, a.delay_imports_count
+        );
+        println!(
+            "  heap_alloc={}  crt_ucrt={}  crt_msvcrt={}  crt_legacy={}",
+            heap_alloc_any, a.has_ucrt, a.has_msvcrt, a.has_legacy_crt
+        );
+        println!(
+            "  custom_allocator={custom_str}  gc_runtime={gc_str}"
+        );
+        for (idx, (dll, is_delay)) in a.sample_imports.iter().take(5).enumerate() {
+            if *is_delay {
+                println!("  [{idx}] {dll} [delay]");
+            } else {
+                println!("  [{idx}] {dll}");
+            }
         }
     }
     Ok(())
+}
+
+fn cmd_inspect(args: &[String]) -> Result<i32, String> {
+    let mut as_json = false;
+    let mut target: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            "--json" => as_json = true,
+            s if s.starts_with('-') => return Err(format!("Unknown inspect flag: {s}")),
+            s => {
+                if target.is_some() {
+                    return Err("Usage: rminject inspect [--json] <binary>".into());
+                }
+                target = Some(s);
+            }
+        }
+    }
+    let Some(t) = target else {
+        return Err("Usage: rminject inspect [--json] <binary>".into());
+    };
+    let path = Path::new(t);
+    let a = analyze_pe(path)?;
+    let (allocator_kind, eligibility, reason) = classify_pe(&a);
+    let dep_hex = format!("0x{:04x}", a.dependent_load_flags.unwrap_or(0));
+
+    if as_json {
+        println!(
+            "{{\n  \"path\": {},\n  \"arch\": {},\n  \"signed\": {},\n  \"cfg\": {},\n  \"dependent_load_flags\": {},\n  \"has_miheap\": {},\n  \"has_miheap_env\": {},\n  \"allocator_kind\": {},\n  \"eligibility\": {},\n  \"reason\": {},\n  \"imports\": {{ \"heap_alloc\": {}, \"ucrt\": {}, \"msvcrt\": {}, \"legacy_crt\": {}, \"ntdll_heap\": {} }}\n}}",
+            json_escape(&path.display().to_string()),
+            json_escape(&a.arch),
+            a.signed,
+            a.cfg,
+            json_escape(&dep_hex),
+            a.has_miheap,
+            a.has_miheap_env,
+            json_escape(allocator_kind),
+            json_escape(eligibility),
+            json_escape(&reason),
+            a.has_heap_alloc,
+            a.has_ucrt,
+            a.has_msvcrt,
+            a.has_legacy_crt,
+            a.has_ntdll_heap,
+        );
+    } else {
+        println!("path                 : {}", path.display());
+        println!("arch                 : {}", a.arch);
+        println!("signed               : {}", a.signed);
+        println!("cfg                  : {}", a.cfg);
+        println!("dependent_load_flags : {dep_hex}");
+        println!("has_miheap           : {}", a.has_miheap);
+        println!("has_miheap_env       : {}", a.has_miheap_env);
+        println!("allocator_kind       : {allocator_kind}");
+        println!("eligibility          : {eligibility}");
+        println!("reason               : {reason}");
+        println!(
+            "imports              : heap_alloc={} ucrt={} msvcrt={} legacy_crt={} ntdll_heap={}",
+            a.has_heap_alloc, a.has_ucrt, a.has_msvcrt, a.has_legacy_crt, a.has_ntdll_heap
+        );
+    }
+    Ok(0)
 }
 
 fn cmd_config(args: &[String]) -> Result<i32, String> {
@@ -874,7 +1408,7 @@ fn parse_toml_value(raw: &str) -> String {
     before_comment.trim().to_string()
 }
 
-fn load_toml_env_for_exe(exe_path: &Path) -> Vec<(String, String)> {
+fn load_toml_env_for_exe(exe_path: &Path, use_large: bool) -> Vec<(String, String)> {
     let exe_name = exe_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -906,64 +1440,81 @@ fn load_toml_env_for_exe(exe_path: &Path) -> Vec<(String, String)> {
         }
     };
 
+    // Pass order guarantees [Settings] -> [Environment] -> [Large] (when --large) -> [Process."<exe>"]
+    let mut passes: Vec<u8> = vec![1, 2];
+    if use_large {
+        passes.push(3);
+    }
+    passes.push(4);
+
     for file in files {
         let Ok(text) = fs::read_to_string(&file) else {
             continue;
         };
-        let mut active_sec = 0u8; // 0=none, 1=settings, 2=env, 3=proc_match
-        for raw_line in text.lines() {
-            let line = raw_line.trim_start_matches('\u{feff}').trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                let hdr = line[1..line.len() - 1].trim();
-                if hdr.eq_ignore_ascii_case("Settings") || hdr.eq_ignore_ascii_case("miheap") {
-                    active_sec = 1;
-                } else if hdr.eq_ignore_ascii_case("Environment")
-                    || hdr.eq_ignore_ascii_case("env")
-                    || hdr.eq_ignore_ascii_case("mimalloc")
-                {
-                    active_sec = 2;
-                } else {
-                    let target = hdr
-                        .strip_prefix("Process.")
-                        .or_else(|| hdr.strip_prefix("process."))
-                        .or_else(|| hdr.strip_prefix("App."))
-                        .unwrap_or(hdr)
-                        .trim_matches(|c| c == '"' || c == '\'');
-                    active_sec = if target.eq_ignore_ascii_case(exe_name) {
-                        3
-                    } else {
-                        0
-                    };
+        for &target_sec in &passes {
+            let mut active_sec = 0u8; // 1=settings, 2=env, 3=large, 4=proc_match
+            for raw_line in text.lines() {
+                let line = raw_line.trim_start_matches('\u{feff}').trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
                 }
-                continue;
-            }
-            let Some((k_raw, v_raw)) = line.split_once('=') else {
-                continue;
-            };
-            let key = k_raw.trim();
-            let val = expand_env_vars(&parse_toml_value(v_raw));
-            match active_sec {
-                1 => {
-                    if key.eq_ignore_ascii_case("spawn_console") {
-                        set_pair(&mut pairs, "MIHEAP_CONSOLE", val);
-                    } else if key.eq_ignore_ascii_case("console_pause") {
-                        set_pair(&mut pairs, "MIHEAP_CONSOLE_PAUSE", val);
+                if line.starts_with('[') && line.ends_with(']') {
+                    let hdr = line[1..line.len() - 1].trim();
+                    if hdr.eq_ignore_ascii_case("Settings") || hdr.eq_ignore_ascii_case("miheap") {
+                        active_sec = 1;
+                    } else if hdr.eq_ignore_ascii_case("Environment")
+                        || hdr.eq_ignore_ascii_case("env")
+                        || hdr.eq_ignore_ascii_case("mimalloc")
+                    {
+                        active_sec = 2;
+                    } else if hdr.eq_ignore_ascii_case("Large")
+                        || hdr.eq_ignore_ascii_case("LargePages")
+                        || hdr.eq_ignore_ascii_case("Huge")
+                    {
+                        active_sec = 3;
+                    } else {
+                        let target = hdr
+                            .strip_prefix("Process.")
+                            .or_else(|| hdr.strip_prefix("process."))
+                            .or_else(|| hdr.strip_prefix("App."))
+                            .unwrap_or(hdr)
+                            .trim_matches(|c| c == '"' || c == '\'');
+                        active_sec = if target.eq_ignore_ascii_case(exe_name) {
+                            4
+                        } else {
+                            0
+                        };
                     }
+                    continue;
                 }
-                2 | 3 => {
-                    let mapped = if key.eq_ignore_ascii_case("spawn_console") {
-                        "MIHEAP_CONSOLE"
-                    } else if key.eq_ignore_ascii_case("console_pause") {
-                        "MIHEAP_CONSOLE_PAUSE"
-                    } else {
-                        key
-                    };
-                    set_pair(&mut pairs, mapped, val);
+                if active_sec != target_sec {
+                    continue;
                 }
-                _ => {}
+                let Some((k_raw, v_raw)) = line.split_once('=') else {
+                    continue;
+                };
+                let key = k_raw.trim();
+                let val = expand_env_vars(&parse_toml_value(v_raw));
+                match active_sec {
+                    1 => {
+                        if key.eq_ignore_ascii_case("spawn_console") {
+                            set_pair(&mut pairs, "MIHEAP_CONSOLE", val);
+                        } else if key.eq_ignore_ascii_case("console_pause") {
+                            set_pair(&mut pairs, "MIHEAP_CONSOLE_PAUSE", val);
+                        }
+                    }
+                    2..=4 => {
+                        let mapped = if key.eq_ignore_ascii_case("spawn_console") {
+                            "MIHEAP_CONSOLE"
+                        } else if key.eq_ignore_ascii_case("console_pause") {
+                            "MIHEAP_CONSOLE_PAUSE"
+                        } else {
+                            key
+                        };
+                        set_pair(&mut pairs, mapped, val);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -985,7 +1536,282 @@ fn binary_has_miheap_env(exe_path: &Path) -> bool {
         .any(|d| d.dll.eq_ignore_ascii_case(MIHEAP_ENV_DLL))
 }
 
-fn run_with_early_apc_inject(exe_path: &Path, args: &[String], dll_paths: &[PathBuf]) -> Result<i32, String> {
+struct ChildGuard {
+    h_process: isize,
+    h_thread: isize,
+    armed: bool,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if self.armed && self.h_process != 0 {
+                TerminateProcess(self.h_process, 1);
+            }
+            if self.h_thread != 0 {
+                CloseHandle(self.h_thread);
+            }
+            if self.h_process != 0 {
+                CloseHandle(self.h_process);
+            }
+        }
+    }
+}
+
+unsafe fn read_remote_exact(h_process: isize, addr: u64, buf: &mut [u8]) -> Result<(), String> {
+    let mut nread = 0usize;
+    if ReadProcessMemory(
+        h_process,
+        addr as *const core::ffi::c_void,
+        buf.as_mut_ptr() as *mut core::ffi::c_void,
+        buf.len(),
+        &mut nread,
+    ) == 0
+        || nread != buf.len()
+    {
+        return Err(format!(
+            "ReadProcessMemory failed at 0x{addr:016x} ({} B, win32={})",
+            buf.len(),
+            GetLastError()
+        ));
+    }
+    Ok(())
+}
+
+unsafe fn write_remote_exact(h_process: isize, addr: u64, buf: &[u8]) -> Result<(), String> {
+    let mut nwritten = 0usize;
+    if WriteProcessMemory(
+        h_process,
+        addr as *mut core::ffi::c_void,
+        buf.as_ptr() as *const core::ffi::c_void,
+        buf.len(),
+        &mut nwritten,
+    ) == 0
+        || nwritten != buf.len()
+    {
+        return Err(format!(
+            "WriteProcessMemory failed at 0x{addr:016x} ({} B, win32={})",
+            buf.len(),
+            GetLastError()
+        ));
+    }
+    Ok(())
+}
+
+unsafe fn write_remote_protected(h_process: isize, addr: u64, buf: &[u8]) -> Result<(), String> {
+    const PAGE_READWRITE: u32 = 0x04;
+    let mut old_prot = 0u32;
+    if VirtualProtectEx(
+        h_process,
+        addr as *mut core::ffi::c_void,
+        buf.len(),
+        PAGE_READWRITE,
+        &mut old_prot,
+    ) == 0
+    {
+        return Err(format!(
+            "VirtualProtectEx(RW) failed at 0x{addr:016x} ({} B, win32={})",
+            buf.len(),
+            GetLastError()
+        ));
+    }
+    let write_res = write_remote_exact(h_process, addr, buf);
+    let mut dummy = 0u32;
+    let _ = VirtualProtectEx(
+        h_process,
+        addr as *mut core::ffi::c_void,
+        buf.len(),
+        old_prot,
+        &mut dummy,
+    );
+    write_res
+}
+
+unsafe fn read_remote_cstr(h_process: isize, addr: u64) -> Result<String, String> {
+    let mut bytes = Vec::with_capacity(64);
+    let mut cur = addr;
+    while bytes.len() < 512 {
+        let page_rem = (0x1000 - (cur & 0xFFF)) as usize;
+        let chunk_len = page_rem.min(512 - bytes.len()).min(128);
+        let mut chunk = vec![0u8; chunk_len];
+        read_remote_exact(h_process, cur, &mut chunk)?;
+        if let Some(pos) = chunk.iter().position(|&b| b == 0) {
+            bytes.extend_from_slice(&chunk[..pos]);
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+        cur = cur.saturating_add(chunk_len as u64);
+    }
+    Err(format!("Unterminated remote C string at 0x{addr:016x}"))
+}
+
+unsafe fn query_remote_image_base(h_process: isize) -> Result<u64, String> {
+    let ntdll_w = to_wide_null(OsStr::new("ntdll.dll"));
+    let ntdll = GetModuleHandleW(ntdll_w.as_ptr());
+    if ntdll == 0 {
+        return Err("GetModuleHandleW(ntdll.dll) failed".into());
+    }
+    let proc_ptr = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast());
+    if proc_ptr.is_null() {
+        return Err("GetProcAddress(NtQueryInformationProcess) failed".into());
+    }
+    let nt_query: PfnNtQueryInformationProcess = std::mem::transmute(proc_ptr);
+    let mut pbi = ProcessBasicInformation {
+        reserved1: 0,
+        peb_base_address: 0,
+        reserved2: [0, 0],
+        unique_process_id: 0,
+        reserved3: 0,
+    };
+    let mut ret_len = 0u32;
+    let status = nt_query(
+        h_process,
+        0,
+        &mut pbi as *mut _ as *mut core::ffi::c_void,
+        std::mem::size_of::<ProcessBasicInformation>() as u32,
+        &mut ret_len,
+    );
+    if status < 0 || pbi.peb_base_address == 0 {
+        return Err(format!(
+            "NtQueryInformationProcess(ProcessBasicInformation) failed: NTSTATUS=0x{status:08x}"
+        ));
+    }
+    let mut ib_buf = [0u8; 8];
+    read_remote_exact(h_process, (pbi.peb_base_address + 0x10) as u64, &mut ib_buf)?;
+    let image_base = u64::from_le_bytes(ib_buf);
+    if image_base == 0 {
+        return Err("Remote PEB ImageBaseAddress is 0".into());
+    }
+    Ok(image_base)
+}
+
+unsafe fn alloc_remote_within_2gb(
+    h_process: isize,
+    image_base: u64,
+    size_of_image: u32,
+    alloc_size: usize,
+) -> Result<u64, String> {
+    const MEM_FREE: u32 = 0x10000;
+    const MEM_COMMIT_RESERVE: u32 = 0x3000;
+    const PAGE_READWRITE: u32 = 0x04;
+
+    // PE32+ IMAGE_IMPORT_DESCRIPTOR RVAs are unsigned 32-bit offsets above ImageBase.
+    // Restrict to [ImageBase + SizeOfImage .. ImageBase + 2 GiB) so every RVA fits cleanly.
+    let scan_start = align_up_u64(image_base.saturating_add(size_of_image as u64), 0x10000);
+    let max_end = image_base.saturating_add(0x7FFF_FFFF);
+    let mut cur = scan_start;
+
+    while cur < max_end {
+        let mut mbi = MemoryBasicInformation {
+            base_address: 0,
+            allocation_base: 0,
+            allocation_protect: 0,
+            partition_id: 0,
+            _pad1: 0,
+            region_size: 0,
+            state: 0,
+            protect: 0,
+            mem_type: 0,
+            _pad2: 0,
+        };
+        let q = VirtualQueryEx(
+            h_process,
+            cur as *const core::ffi::c_void,
+            &mut mbi,
+            std::mem::size_of::<MemoryBasicInformation>(),
+        );
+        if q == 0 || mbi.region_size == 0 {
+            break;
+        }
+        let region_end = (mbi.base_address as u64).saturating_add(mbi.region_size as u64);
+        if mbi.state == MEM_FREE {
+            let mut cand = align_up_u64((mbi.base_address as u64).max(scan_start), 0x10000);
+            let limit = region_end.min(max_end);
+            while cand.saturating_add(alloc_size as u64) <= limit {
+                let remote = VirtualAllocEx(
+                    h_process,
+                    cand as *mut core::ffi::c_void,
+                    alloc_size,
+                    MEM_COMMIT_RESERVE,
+                    PAGE_READWRITE,
+                );
+                if !remote.is_null() {
+                    let remote_u64 = remote as u64;
+                    if remote_u64 >= image_base
+                        && remote_u64 - image_base + (alloc_size as u64) <= 0x7FFF_FFFF
+                    {
+                        return Ok(remote_u64);
+                    }
+                }
+                cand = cand.saturating_add(0x10000);
+            }
+        }
+        let next = align_up_u64(region_end, 0x10000);
+        if next <= cur {
+            break;
+        }
+        cur = next;
+    }
+
+    Err(format!(
+        "Cannot allocate {alloc_size} B remote RW memory within +2 GiB RVA window of ImageBase 0x{image_base:016x} (SizeOfImage=0x{size_of_image:x})"
+    ))
+}
+
+fn build_child_env_block(overrides: &[(String, String)], ensure_path_dir: Option<&Path>) -> Vec<u16> {
+    let mut vars: Vec<(String, String)> = env::vars_os()
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+        .collect();
+
+    if let Some(dir) = ensure_path_dir {
+        let dir_str = dir.to_string_lossy().into_owned();
+        let dir_norm = dir_str.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+        if let Some((_, path_val)) = vars.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PATH")) {
+            let already = env::split_paths(OsStr::new(path_val.as_str())).any(|p| {
+                p.to_string_lossy()
+                    .trim_end_matches(['\\', '/'])
+                    .to_ascii_lowercase()
+                    == dir_norm
+            });
+            if !already {
+                if path_val.is_empty() {
+                    *path_val = dir_str;
+                } else {
+                    *path_val = format!("{dir_str};{path_val}");
+                }
+            }
+        } else {
+            vars.push(("PATH".to_string(), dir_str));
+        }
+    }
+
+    for (k, v) in overrides {
+        if let Some(entry) = vars.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(k)) {
+            entry.1 = v.clone();
+        } else {
+            vars.push((k.clone(), v.clone()));
+        }
+    }
+
+    vars.sort_by_key(|a| a.0.to_ascii_uppercase());
+
+    let mut block = Vec::new();
+    for (k, v) in vars {
+        let line = format!("{k}={v}");
+        block.extend(OsStr::new(&line).encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+fn run_with_inmemory_pe_inject(
+    exe_path: &Path,
+    args: &[String],
+    dlls: &[(PathBuf, &str)],
+    env_overrides: &[(String, String)],
+    mimalloc_dir: &Path,
+) -> Result<i32, String> {
     let mut cmdline = quote_win_arg(&exe_path.to_string_lossy());
     for a in args {
         cmdline.push(' ');
@@ -993,6 +1819,7 @@ fn run_with_early_apc_inject(exe_path: &Path, args: &[String], dll_paths: &[Path
     }
     let app_w = to_wide_null(exe_path.as_os_str());
     let mut cmdline_w = to_wide_null(OsStr::new(&cmdline));
+    let mut env_block = build_child_env_block(env_overrides, Some(mimalloc_dir));
 
     let si = StartupInfoW {
         cb: std::mem::size_of::<StartupInfoW>() as u32,
@@ -1022,8 +1849,7 @@ fn run_with_early_apc_inject(exe_path: &Path, args: &[String], dll_paths: &[Path
     };
 
     const CREATE_SUSPENDED: u32 = 0x4;
-    const MEM_COMMIT_RESERVE: u32 = 0x3000;
-    const PAGE_READWRITE: u32 = 0x04;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
     const INFINITE: u32 = 0xFFFF_FFFF;
 
     unsafe {
@@ -1033,8 +1859,8 @@ fn run_with_early_apc_inject(exe_path: &Path, args: &[String], dll_paths: &[Path
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             1,
-            CREATE_SUSPENDED,
-            std::ptr::null_mut(),
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            env_block.as_mut_ptr() as *mut core::ffi::c_void,
             std::ptr::null(),
             &si,
             &mut pi,
@@ -1043,72 +1869,231 @@ fn run_with_early_apc_inject(exe_path: &Path, args: &[String], dll_paths: &[Path
             return Err(format!("CreateProcessW failed: error {}", GetLastError()));
         }
 
-        let k32_w = to_wide_null(OsStr::new("kernel32.dll"));
-        let k32 = GetModuleHandleW(k32_w.as_ptr());
-        let load_lib = GetProcAddress(k32, b"LoadLibraryW\0".as_ptr());
-        if load_lib.is_null() {
-            TerminateProcess(pi.h_process, 1);
-            CloseHandle(pi.h_thread);
-            CloseHandle(pi.h_process);
-            return Err("GetProcAddress(LoadLibraryW) failed".into());
+        let mut child = ChildGuard {
+            h_process: pi.h_process,
+            h_thread: pi.h_thread,
+            armed: true,
+        };
+
+        let image_base = query_remote_image_base(child.h_process)?;
+        let mut hdr = vec![0u8; 0x1000];
+        read_remote_exact(child.h_process, image_base, &mut hdr)?;
+        if &hdr[0..2] != b"MZ" {
+            return Err(format!("Remote image at 0x{image_base:016x} missing MZ header"));
+        }
+        let pe_off = read_u32(&hdr, 0x3C) as usize;
+        if pe_off + 24 > hdr.len() || &hdr[pe_off..pe_off + 4] != b"PE\0\0" {
+            return Err(format!("Remote image at 0x{image_base:016x} missing PE signature"));
+        }
+        let machine = read_u16(&hdr, pe_off + 4);
+        if machine != 0x8664 {
+            return Err(format!(
+                "In-memory PE injection requires x86-64 PE64 (got machine=0x{machine:04x})"
+            ));
+        }
+        let opt_sz = read_u16(&hdr, pe_off + 20) as usize;
+        let opt_off = pe_off + 24;
+        if opt_off + opt_sz > hdr.len() {
+            let need = align_up(opt_off + opt_sz, 0x1000);
+            if need > 0x10_0000 {
+                return Err("Remote PE optional header exceeds 1 MiB".into());
+            }
+            hdr.resize(need, 0);
+            read_remote_exact(child.h_process, image_base, &mut hdr)?;
+        }
+        if opt_sz < 112 || read_u16(&hdr, opt_off) != 0x20B {
+            return Err("Remote target is not a valid PE32+ (64-bit) image".into());
         }
 
-        for dll_path in dll_paths {
-            let dll_w = to_wide_null(dll_path.as_os_str());
-            let byte_len = dll_w.len() * 2;
-            let remote = VirtualAllocEx(
-                pi.h_process,
-                std::ptr::null_mut(),
-                byte_len,
-                MEM_COMMIT_RESERVE,
-                PAGE_READWRITE,
-            );
-            if remote.is_null() {
-                let err = GetLastError();
-                TerminateProcess(pi.h_process, 1);
-                CloseHandle(pi.h_thread);
-                CloseHandle(pi.h_process);
-                return Err(format!("VirtualAllocEx failed: error {err}"));
+        let size_of_image = read_u32(&hdr, opt_off + 56);
+        let avail_dirs = (opt_off + opt_sz).saturating_sub(opt_off + 112) / 8;
+        let num_rva = (read_u32(&hdr, opt_off + 108) as usize).min(16).min(avail_dirs);
+        let dd_off = opt_off + 112;
+        let read_dir = |idx: usize| -> (u32, u32) {
+            if idx < num_rva {
+                (read_u32(&hdr, dd_off + idx * 8), read_u32(&hdr, dd_off + idx * 8 + 4))
+            } else {
+                (0, 0)
+            }
+        };
+        let (imp_rva, _) = read_dir(1);
+        let (lc_rva, _) = read_dir(10);
+        let (bound_rva, bound_sz) = read_dir(11);
+
+        let mut existing_raw: Vec<[u32; 5]> = Vec::new();
+        let mut has_env = false;
+        let mut has_heap = false;
+        if imp_rva != 0 {
+            for idx in 0..4096usize {
+                let mut desc = [0u8; 20];
+                read_remote_exact(
+                    child.h_process,
+                    image_base + imp_rva as u64 + (idx * 20) as u64,
+                    &mut desc,
+                )?;
+                let ilt = read_u32(&desc, 0);
+                let ts = read_u32(&desc, 4);
+                let fwd = read_u32(&desc, 8);
+                let name_rva = read_u32(&desc, 12);
+                let iat = read_u32(&desc, 16);
+                if ilt == 0 && name_rva == 0 && iat == 0 {
+                    break;
+                }
+                if name_rva != 0 {
+                    if let Ok(dll_name) = read_remote_cstr(child.h_process, image_base + name_rva as u64)
+                    {
+                        let base = dll_basename_lower(&dll_name);
+                        if base == MIHEAP_ENV_DLL {
+                            has_env = true;
+                        } else if base == MIHEAP_DLL {
+                            has_heap = true;
+                        }
+                    }
+                }
+                existing_raw.push([ilt, ts, fwd, name_rva, iat]);
+            }
+        }
+
+        let mut to_add: Vec<(String, &str)> = Vec::new();
+        for (path, exp_name) in dlls {
+            let file_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let base = dll_basename_lower(&file_name);
+            if (base == MIHEAP_ENV_DLL && has_env) || (base == MIHEAP_DLL && has_heap) {
+                continue;
+            }
+            to_add.push((path.to_string_lossy().into_owned(), *exp_name));
+        }
+
+        if !to_add.is_empty() {
+            if num_rva <= 1 {
+                return Err("Remote PE header has no DataDirectory[IMPORT] slot".into());
+            }
+            let num_desc = to_add.len() + existing_raw.len();
+            let imp_table_sz = (num_desc + 1) * 20;
+            let mut cursor = align_up(imp_table_sz, 8);
+            let mut layout = Vec::with_capacity(to_add.len());
+            for (dll_name, exp_name) in &to_add {
+                let ilt_off = align_up(cursor, 8);
+                let iat_off = ilt_off + 16;
+                let dll_str_off = iat_off + 16;
+                let dll_bytes = format!("{dll_name}\0").into_bytes();
+                let ibn_off = align_up(dll_str_off + dll_bytes.len(), 2);
+                let mut ibn_bytes = Vec::with_capacity(2 + exp_name.len() + 1);
+                ibn_bytes.extend_from_slice(&0u16.to_le_bytes());
+                ibn_bytes.extend_from_slice(exp_name.as_bytes());
+                ibn_bytes.push(0);
+                cursor = ibn_off + ibn_bytes.len();
+                layout.push((ilt_off, iat_off, dll_str_off, dll_bytes, ibn_off, ibn_bytes));
             }
 
-            let mut written = 0usize;
-            if WriteProcessMemory(
-                pi.h_process,
-                remote,
-                dll_w.as_ptr() as *const _,
-                byte_len,
-                &mut written,
-            ) == 0
-                || QueueUserAPC(load_lib, pi.h_thread, remote as usize) == 0
+            let alloc_size = align_up(cursor, 0x1000);
+            let remote_addr = alloc_remote_within_2gb(
+                child.h_process,
+                image_base,
+                size_of_image,
+                alloc_size,
+            )?;
+            let new_va = (remote_addr - image_base) as u32;
+
+            let mut payload = vec![0u8; cursor];
+            for (idx, (ilt_off, iat_off, dll_str_off, dll_bytes, ibn_off, ibn_bytes)) in
+                layout.iter().enumerate()
             {
-                let err = GetLastError();
-                TerminateProcess(pi.h_process, 1);
-                CloseHandle(pi.h_thread);
-                CloseHandle(pi.h_process);
-                return Err(format!("Early-bird APC injection failed: error {err}"));
+                let base = idx * 20;
+                write_u32(&mut payload, base, new_va + *ilt_off as u32);
+                write_u32(&mut payload, base + 4, 0);
+                write_u32(&mut payload, base + 8, 0);
+                write_u32(&mut payload, base + 12, new_va + *dll_str_off as u32);
+                write_u32(&mut payload, base + 16, new_va + *iat_off as u32);
+
+                let ibn_rva = (new_va + *ibn_off as u32) as u64;
+                write_u64(&mut payload, *ilt_off, ibn_rva);
+                write_u64(&mut payload, *iat_off, ibn_rva);
+
+                payload[*dll_str_off..*dll_str_off + dll_bytes.len()].copy_from_slice(dll_bytes);
+                payload[*ibn_off..*ibn_off + ibn_bytes.len()].copy_from_slice(ibn_bytes);
             }
+
+            for (i, raw) in existing_raw.iter().enumerate() {
+                let base = (to_add.len() + i) * 20;
+                for (k, &v) in raw.iter().enumerate() {
+                    write_u32(&mut payload, base + k * 4, v);
+                }
+            }
+
+            write_remote_exact(child.h_process, remote_addr, &payload)?;
+
+            // Clear BoundImport directory (index 11) in remote PE header if present
+            if num_rva > 11 && (bound_rva != 0 || bound_sz != 0) {
+                write_remote_protected(
+                    child.h_process,
+                    image_base + (dd_off + 11 * 8) as u64,
+                    &[0u8; 8],
+                )?;
+            }
+
+            // Clear remote LoadConfig.DependentLoadFlags (offset 0x4E) if non-zero
+            if lc_rva != 0 {
+                let mut lc_hdr = [0u8; 0x50];
+                if read_remote_exact(child.h_process, image_base + lc_rva as u64, &mut lc_hdr).is_ok()
+                {
+                    let lc_size = read_u32(&lc_hdr, 0);
+                    let dep_flags = read_u16(&lc_hdr, 0x4E);
+                    if lc_size >= 0x50 && dep_flags != 0 {
+                        write_remote_protected(
+                            child.h_process,
+                            image_base + lc_rva as u64 + 0x4E,
+                            &[0u8; 2],
+                        )?;
+                    }
+                }
+            }
+
+            // Repoint DataDirectory[IMPORT] to the newly allocated descriptor table
+            let mut new_imp_dir = [0u8; 8];
+            write_u32(&mut new_imp_dir, 0, new_va);
+            write_u32(&mut new_imp_dir, 4, imp_table_sz as u32);
+            write_remote_protected(
+                child.h_process,
+                image_base + (dd_off + 8) as u64,
+                &new_imp_dir,
+            )?;
         }
 
-        ResumeThread(pi.h_thread);
-        WaitForSingleObject(pi.h_process, INFINITE);
+        if ResumeThread(child.h_thread) == u32::MAX {
+            return Err(format!("ResumeThread failed: error {}", GetLastError()));
+        }
+        child.armed = false;
+
+        WaitForSingleObject(child.h_process, INFINITE);
         let mut exit_code: u32 = 0;
-        GetExitCodeProcess(pi.h_process, &mut exit_code);
-        CloseHandle(pi.h_thread);
-        CloseHandle(pi.h_process);
+        GetExitCodeProcess(child.h_process, &mut exit_code);
         Ok(exit_code as i32)
     }
 }
 
 fn cmd_run(args: &[String]) -> Result<i32, String> {
+    let mut use_large = false;
     let mut no_huge_pages = false;
     let mut verbose = false;
     let mut quiet = false;
     let mut console = false;
     let mut inject = false;
+    let mut follow_children = false;
+    let mut hook_private_heaps = false;
     let mut log_file: Option<String> = None;
+    let mut explicit_envs: Vec<(String, String)> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--large" | "-l" => {
+                use_large = true;
+                i += 1;
+            }
             "--no-huge-pages" => {
                 no_huge_pages = true;
                 i += 1;
@@ -1127,6 +2112,39 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
             }
             "--inject" | "-i" => {
                 inject = true;
+                i += 1;
+            }
+            "--follow-children" => {
+                follow_children = true;
+                i += 1;
+            }
+            "--hook-private-heaps" => {
+                hook_private_heaps = true;
+                i += 1;
+            }
+            "--env" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--env requires KEY=VAL".into());
+                }
+                let Some((k, v)) = args[i].split_once('=') else {
+                    return Err(format!("Invalid --env argument (expected KEY=VAL): {}", args[i]));
+                };
+                if k.is_empty() {
+                    return Err("Invalid --env argument: empty key".into());
+                }
+                explicit_envs.push((k.to_string(), v.to_string()));
+                i += 1;
+            }
+            s if s.starts_with("--env=") => {
+                let kv = &s["--env=".len()..];
+                let Some((k, v)) = kv.split_once('=') else {
+                    return Err(format!("Invalid --env argument (expected KEY=VAL): {s}"));
+                };
+                if k.is_empty() {
+                    return Err("Invalid --env argument: empty key".into());
+                }
+                explicit_envs.push((k.to_string(), v.to_string()));
                 i += 1;
             }
             "--log-file" => {
@@ -1156,12 +2174,12 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     // Settings come from miheap.toml (never hardcoded in rminject.exe).
     // For binaries patched with miheap-env.dll, miheap-env.dll loads miheap.toml
     // natively at startup (including for subprocesses), so we only pass explicit
-    // CLI overrides here. For unpatched / --inject binaries, we also load miheap.toml
-    // into the environment before launching.
+    // CLI overrides here (such as MIHEAP_LARGE=1 for --large, which enables [Large]
+    // while still letting [Process."<exe>"] override it!).
     let mut overrides: Vec<(String, String)> = Vec::new();
     let has_env_dll = !inject && binary_has_miheap_env(&exe_path);
     if !has_env_dll {
-        overrides = load_toml_env_for_exe(&exe_path);
+        overrides = load_toml_env_for_exe(&exe_path, use_large);
     }
 
     let set_override = |vec: &mut Vec<(String, String)>, k: &str, v: &str| {
@@ -1172,7 +2190,11 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         }
     };
 
+    if use_large {
+        set_override(&mut overrides, "MIHEAP_LARGE", "1");
+    }
     if no_huge_pages {
+        set_override(&mut overrides, "MIHEAP_LARGE", "0");
         set_override(&mut overrides, "MIMALLOC_RESERVE_HUGE_OS_PAGES", "0");
         set_override(&mut overrides, "MIMALLOC_ALLOW_LARGE_OS_PAGES", "0");
     }
@@ -1189,9 +2211,18 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     if console {
         set_override(&mut overrides, "MIHEAP_CONSOLE", "1");
     }
+    if follow_children {
+        set_override(&mut overrides, "MIHEAP_FOLLOW_CHILDREN", "1");
+    }
+    if hook_private_heaps {
+        set_override(&mut overrides, "MIHEAP_HOOK_PRIVATE_HEAPS", "1");
+    }
     if let Some(lf) = log_file {
         set_override(&mut overrides, "MIHEAP_LOG", "1");
         set_override(&mut overrides, "MIHEAP_LOG_FILE", &lf);
+    }
+    for (k, v) in explicit_envs {
+        set_override(&mut overrides, &k, &v);
     }
 
     if inject {
@@ -1201,15 +2232,12 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         if !heap_dll.is_file() {
             return Err(format!("{MIHEAP_DLL} not found in {}", dir.display()));
         }
-        let mut dlls = Vec::new();
+        let mut dlls: Vec<(PathBuf, &str)> = Vec::new();
         if env_dll.is_file() {
-            dlls.push(env_dll);
+            dlls.push((env_dll, MIHEAP_ENV_EXPORT));
         }
-        dlls.push(heap_dll);
-        for (k, v) in &overrides {
-            env::set_var(k, v);
-        }
-        return run_with_early_apc_inject(&exe_path, rest, &dlls);
+        dlls.push((heap_dll, MIHEAP_ENTRY_EXPORT));
+        return run_with_inmemory_pe_inject(&exe_path, rest, &dlls, &overrides, &dir);
     }
 
     let mut child = Command::new(&exe_path);
@@ -1232,17 +2260,22 @@ USAGE:
   rminject <binary.exe|dll>                          Shorthand for `rminject patch <binary>`
   rminject restore <binary.exe|dll...>               Restore from .bak backup(s)
   rminject status [binary.exe|dll...]                Show active DLLs, config & PE hook status
+  rminject inspect [--json] <binary.exe|dll>         Inspect PE allocator linkage & eligibility
   rminject config [--path | --edit]                  Show or edit global C:\\mimalloc\\miheap.toml
   rminject update-mimalloc <v1|v2|v3|path.dll>       Replace active C:\\mimalloc\\mimalloc.dll
   rminject run [OPTIONS] <cmd> [args...]             Run binary (resolves CWD & PATH) using miheap.toml
 
 RUN OPTIONS (optional overrides on top of miheap.toml):
-  --inject, -i         Early-bird APC inject miheap-env + miheap without modifying binary on disk
-  --verbose, -v        Enable MIMALLOC_VERBOSE=1, MIMALLOC_SHOW_STATS=1, MIHEAP_LOG=1
-  --console            Spawn a separate console window for stdout/stderr/mimalloc output
-  --log-file <path>    Also write [miheap] logs to a file
-  --no-huge-pages      Disable large/huge OS pages
-  --quiet, -q          Suppress verbose/stats output"
+  --large, -l              Activate [Large] section from miheap.toml (still applies [Process] overrides)
+  --inject, -i             In-memory PE import-table inject miheap-env + miheap without modifying binary on disk
+  --follow-children        Set MIHEAP_FOLLOW_CHILDREN=1 for child process propagation
+  --hook-private-heaps     Set MIHEAP_HOOK_PRIVATE_HEAPS=1 to back HeapCreate heaps with mimalloc
+  --env KEY=VAL            Override an environment variable (repeatable, e.g. --env MIMALLOC_RESERVE_HUGE_OS_PAGES=3)
+  --verbose, -v            Enable MIMALLOC_VERBOSE=1, MIMALLOC_SHOW_STATS=1, MIHEAP_LOG=1
+  --console                Spawn a separate console window for stdout/stderr/mimalloc output
+  --log-file <path>        Also write [miheap] logs to a file
+  --no-huge-pages          Disable large/huge OS pages
+  --quiet, -q              Suppress verbose/stats output"
     );
 }
 
@@ -1281,6 +2314,7 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             show_status(&args[1..])?;
             Ok(0)
         }
+        "inspect" => cmd_inspect(&args[1..]),
         "config" => cmd_config(&args[1..]),
         "update-mimalloc" | "set-mimalloc" => {
             if args.len() != 2 {
